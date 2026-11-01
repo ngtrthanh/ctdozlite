@@ -313,8 +313,16 @@ impl MessageStore {
                 let mut link_desc = None;
                 let mut link_thumb = None;
                 let mut link_src = None;
+                // Never trust the legacy sender_id column: older builds stored
+                // display names there. Only the network-derived marker is valid.
+                let mut verified_sender_uid = String::new();
                 if !sm.raw_json.is_empty() {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sm.raw_json) {
+                        if let Some(uid) = val.get("sender_uid").and_then(|v| v.as_str()) {
+                            if !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()) {
+                                verified_sender_uid = uid.to_string();
+                            }
+                        }
                         sticker_id = val
                             .get("stickerId")
                             .or_else(|| val.get("id"))
@@ -382,7 +390,7 @@ impl MessageStore {
                     } else {
                         sm.sender_id.clone()
                     },
-                    sender_id: sm.sender_id,
+                    sender_id: verified_sender_uid,
                     text: sm.text,
                     time,
                     is_outgoing: sm.is_outgoing,
@@ -473,6 +481,12 @@ impl From<&ChatMessage> for StoredMessage {
         } else {
             "chat.text".to_string()
         };
+        if !m.is_outgoing && !m.sender_id.is_empty()
+            && m.sender_id.bytes().all(|b| b.is_ascii_digit())
+        {
+            // Explicit provenance tag used by the read-only supplier bridge.
+            meta.insert("sender_uid".into(), serde_json::json!(m.sender_id));
+        }
         if let Some(ref rid) = m.reply_to_id {
             meta.insert("reply_to_id".into(), serde_json::json!(rid));
         }
@@ -761,5 +775,7 @@ mod bridge_sender_uid_tests {
         let saved = StoredMessage::from(&msg);
         assert_eq!(saved.sender_name, "Staff Name");
         assert_eq!(saved.sender_id, "1234567890");
+        let meta: serde_json::Value = serde_json::from_str(&saved.raw_json).unwrap();
+        assert_eq!(meta["sender_uid"], "1234567890");
     }
 }
