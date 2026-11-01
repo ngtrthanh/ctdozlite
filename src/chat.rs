@@ -19,6 +19,9 @@ pub struct ChatMessage {
     pub delivery: crate::message_model::DeliveryState,
     pub id: String,
     pub sender: String,
+    /// Stable Zalo uidFrom/fromUid. Not the sender display name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_id: String,
     pub text: String,
     pub time: String,
     pub is_outgoing: bool,
@@ -73,6 +76,10 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn merge_message_metadata(&mut self, incoming: &Self) -> bool {
+        let sender_id_changed = self.sender_id.is_empty() && !incoming.sender_id.is_empty();
+        if sender_id_changed {
+            self.sender_id = incoming.sender_id.clone();
+        }
         let previous_mentions = self.resolved_mention_uids.clone();
         self.resolved_mention_uids
             .extend(incoming.resolved_mention_uids.clone());
@@ -100,7 +107,7 @@ impl ChatMessage {
             self.history_source = incoming.history_source.clone();
         }
         self.delivery = self.delivery.merge(incoming.delivery);
-        previous_mentions != self.resolved_mention_uids
+        sender_id_changed || previous_mentions != self.resolved_mention_uids
             || before
                 != (
                     self.kind,
@@ -4431,6 +4438,7 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     Some(ChatMessage {
         id: msg_id,
         sender: display_sender,
+        sender_id: uid_from,
         text: content,
         time,
         is_outgoing,
@@ -5880,5 +5888,30 @@ mod message_state_defaults_tests {
             serde_json::from_value(serde_json::to_value(&thread).unwrap()).unwrap();
         assert_eq!(restored.presentation, thread.presentation);
         assert_eq!(restored.unread, thread.unread);
+    }
+}
+
+#[cfg(test)]
+mod stable_sender_id_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn parsed_sender_uid_remains_distinct_from_display_name() {
+        let msg = parse_chat_message(&json!({
+            "msgId": "m-100", "uidFrom": "1234567890", "dName": "Supplier Staff",
+            "content": "Barge HP100 1200t", "ts": 1730000000000_i64
+        })).expect("message");
+        assert_eq!(msg.sender, "Supplier Staff");
+        assert_eq!(msg.sender_id, "1234567890");
+        assert!(!msg.is_outgoing);
+    }
+
+    #[test]
+    fn legacy_cached_messages_without_uid_stay_unverified() {
+        let cached: ChatMessage = serde_json::from_value(json!({
+            "id":"m-100", "sender":"Supplier Staff", "text":"Example",
+            "time":"", "is_outgoing":false, "ts":1
+        })).expect("legacy cache");
+        assert!(cached.sender_id.is_empty());
     }
 }
