@@ -97,11 +97,21 @@ impl MessageStore {
                 msg.raw_json,
             ],
         )?;
-        if rows == 0 && !msg.raw_json.is_empty() {
-            let _ = self.conn.execute(
-                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
-                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text],
-            );
+        if rows == 0 {
+            // Upgrade legacy rows with the stable UID when a fresh network event
+            // supplies it. Never turn a display name into an authorized identity.
+            self.conn.execute(
+                "UPDATE messages SET
+                    raw_json = CASE WHEN ?1 != '' THEN ?1 ELSE raw_json END,
+                    msg_type = ?2,
+                    text = ?4,
+                    sender_id = CASE
+                        WHEN ?5 != '' AND ?5 GLOB '[0-9]*'
+                             AND ?5 NOT GLOB '*[^0-9]*' THEN ?5
+                        ELSE sender_id END
+                 WHERE msg_id = ?3",
+                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text, msg.sender_id],
+            )?;
         }
         Ok(rows > 0)
     }
@@ -368,10 +378,11 @@ impl MessageStore {
                 let cm = ChatMessage {
                     id: sm.msg_id,
                     sender: if !sm.sender_name.is_empty() {
-                        sm.sender_name
+                        sm.sender_name.clone()
                     } else {
-                        sm.sender_id
+                        sm.sender_id.clone()
                     },
+                    sender_id: sm.sender_id,
                     text: sm.text,
                     time,
                     is_outgoing: sm.is_outgoing,
@@ -399,6 +410,9 @@ impl MessageStore {
                             && existing.is_outgoing == cm.is_outgoing
                             && (existing.ts == cm.ts || (existing.ts != 0 && cm.ts != 0 && (existing.ts - cm.ts).abs() < 5000)))
                 }) {
+                    if existing.sender_id.is_empty() && !cm.sender_id.is_empty() {
+                        existing.sender_id = cm.sender_id.clone();
+                    }
                     if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
                         existing.sticker_id = cm.sticker_id;
                         existing.sticker_cate_id = cm.sticker_cate_id;
@@ -504,7 +518,7 @@ impl From<&ChatMessage> for StoredMessage {
                 format!("msg_{}", m.ts)
             },
             thread_id: String::new(),
-            sender_id: if m.is_outgoing { "0".into() } else { m.sender.clone() },
+            sender_id: if m.is_outgoing { "0".into() } else { m.sender_id.clone() },
             sender_name: m.sender.clone(),
             text: m.text.clone(),
             msg_type,
@@ -733,5 +747,19 @@ mod tests {
         assert_eq!(hydrated[0].name, "Test Thread");
         assert_eq!(hydrated[0].messages.len(), 2);
         assert_eq!(hydrated[0].preview, "Hi Alice");
+    }
+}
+
+#[cfg(test)]
+mod bridge_sender_uid_tests {
+    use super::*;
+
+    #[test]
+    fn display_name_is_not_used_as_sender_id() {
+        let msg = ChatMessage { id: "test-id".into(), sender: "Staff Name".into(),
+            sender_id: "1234567890".into(), text: "Barge ETA".into(), ..Default::default() };
+        let saved = StoredMessage::from(&msg);
+        assert_eq!(saved.sender_name, "Staff Name");
+        assert_eq!(saved.sender_id, "1234567890");
     }
 }
